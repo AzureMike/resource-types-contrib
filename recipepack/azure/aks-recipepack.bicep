@@ -1,10 +1,28 @@
 extension radius
 
+@description('Name of the Radius environment to create.')
+param environmentName string = 'default'
+
+@description('Kubernetes namespace the Radius environment deploys resources into.')
+param environmentNamespace string = 'default'
+
 @description('Azure subscription ID the environment provisions resources into.')
 param azureSubscriptionId string
 
 @description('Azure resource group the environment provisions resources into. Must already exist.')
 param azureResourceGroup string
+
+@description('Name of the Kubernetes Gateway resource that Radius.Compute/routes attach to. Must already exist in the cluster.')
+param routesGatewayName string
+
+@description('Namespace where the Kubernetes Gateway resource for Radius.Compute/routes is located.')
+param routesGatewayNamespace string = 'default'
+
+@description('Registry path (e.g. ghcr.io/my-org) that Radius.Compute/containerImages pushes built images to.')
+param containerImagesRegistry string
+
+@description('Name of the Kubernetes Secret holding registry credentials for Radius.Compute/containerImages. Leave empty for an unauthenticated registry.')
+param containerImagesRegistrySecretName string = ''
 
 resource recipes 'Radius.Core/recipePacks@2025-08-01-preview' = {
   name: 'azure-avm'
@@ -247,16 +265,73 @@ resource recipes 'Radius.Core/recipePacks@2025-08-01-preview' = {
           connectionString: 'primaryConnectionString'
         }
       }
+      'Radius.Storage/objectStorage': {
+        kind: 'bicep'
+        source: 'mcr.microsoft.com/bicep/avm/res/storage/storage-account:0.32.1'
+        parameters: {
+          name: '{{context.resource.name}}'
+          kind: 'StorageV2'
+          skuName: 'Standard_LRS'
+          allowBlobPublicAccess: false
+          // The AVM storage-account module is secure-by-default: with no networkAcls
+          // it applies { bypass: 'AzureServices', defaultAction: 'Deny' }, which
+          // firewalls the blob data plane so connecting apps get 403
+          // AuthorizationFailure. Allow key-authenticated data-plane access; data
+          // stays private (allowBlobPublicAccess is false and access needs the key).
+          networkAcls: {
+            bypass: 'AzureServices'
+            defaultAction: 'Allow'
+          }
+          blobServices: {
+            containers: [
+              {
+                name: '{{context.resource.properties.containerName}}'
+              }
+            ]
+          }
+          enableTelemetry: false
+        }
+        outputs: {
+          endpoint: 'primaryBlobEndpoint'
+          accountKey: 'primaryAccessKey'
+          accountName: 'name'
+        }
+      }
       'Radius.Compute/containers': {
         kind: 'bicep'
         source: 'ghcr.io/radius-project/kube-recipes/containers:latest'
+      }
+      'Radius.Compute/persistentVolumes': {
+        kind: 'bicep'
+        source: 'ghcr.io/radius-project/kube-recipes/persistentvolumes:latest'
+      }
+      'Radius.Security/secrets': {
+        kind: 'bicep'
+        source: 'ghcr.io/radius-project/kube-recipes/secrets:latest'
+      }
+      'Radius.Compute/routes': {
+        kind: 'bicep'
+        source: 'ghcr.io/radius-project/kube-recipes/routes:latest'
+        parameters: {
+          gatewayName: routesGatewayName
+          gatewayNamespace: routesGatewayNamespace
+        }
+      }
+      // Note: Radius currently only supports Terraform containerImages 
+      'Radius.Compute/containerImages': {
+        kind: 'terraform'
+        source: 'git::https://github.com/radius-project/resource-types-contrib.git//Compute/containerImages/recipes/kubernetes/terraform'
+        parameters: {
+          registry: containerImagesRegistry
+          registrySecretName: containerImagesRegistrySecretName
+        }
       }
     }
   }
 }
 
 resource env 'Radius.Core/environments@2025-08-01-preview' = {
-  name: 'default'
+  name: environmentName
   properties: {
     providers: {
       azure: {
@@ -264,7 +339,7 @@ resource env 'Radius.Core/environments@2025-08-01-preview' = {
         resourceGroupName: azureResourceGroup
       }
       kubernetes: {
-        namespace: 'default'
+        namespace: environmentNamespace
       }
     }
     recipePacks: [
